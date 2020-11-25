@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Client 支付客户端结构体
+// Client 支付宝客户端
 type Client struct {
 	appId string
 
@@ -52,14 +52,22 @@ func New(gateway, appId, privateKey string, opts ...OptionFunc) *Client {
 }
 
 func (c *Client) Pay(subject, outTradeNo, totalAmount string) (string, error) {
-	v := Values{}
+	v := url.Values{}
 	v.Add("app_id", c.appId)
-	v.Add("method", "alipay.trade.wap.pay")
+	v.Add("method", "alipay.trade.page.pay")
 	v.Add("charset", "utf-8")
 	v.Add("format", "JSON")
 	v.Add("sign_type", "RSA2")
-	v.Add("timestamp", c.timestamp())
+	v.Add("timestamp", c.getTimestamp())
 	v.Add("version", "1.0")
+
+	type BizContent struct {
+		OutTradeNo  string `json:"out_trade_no"`
+		ProductId   string `json:"product_id"`
+		TotalAmount string `json:"total_amount"`
+		Subject     string `json:"subject"`
+		Body        string `json:"body"`
+	}
 
 	biz := BizContent{
 		OutTradeNo:  outTradeNo,
@@ -76,18 +84,17 @@ func (c *Client) Pay(subject, outTradeNo, totalAmount string) (string, error) {
 
 	v.Add("biz_content", string(bytes))
 
-	sign, err := c.signature(v.Params())
+	sign, err := c.getSignature(v)
 	if err != nil {
 		return "", err
 	}
 
-	v.Add("sign", url.QueryEscape(sign))
+	v.Add("sign", sign)
 
-	res, err := url.Parse(c.gateway + "?" + v.Params())
+	res, err := url.Parse(c.gateway + "?" + v.Encode())
 	if err != nil {
 		return "", err
 	}
-
 	return res.String(), nil
 }
 
@@ -108,18 +115,35 @@ func (c *Client) AlipayPublicCert() {
 
 }
 
-func (c *Client) timestamp() string {
+func (c *Client) getTimestamp() string {
 	return time.Now().In(c.location).Format("2006-01-02 15:04:05")
 }
 
-func (c *Client) do(str string) (body []byte, err error) {
-	method := "POST"
-	payload := strings.NewReader(str)
-	var (
-		req  *http.Request
-		resp *http.Response
-	)
+func (c *Client) getSignature(values url.Values) (sign string, err error) {
+	privateKey, err := parsePKCS1PrivateKey(c.appPrivateKey)
+	if err != nil {
+		privateKey, err = parsePKCS8PrivateKey(c.appPrivateKey)
+		if err != nil {
+			return
+		}
+	}
 
+	v := Values(values).Params()
+
+	var bytes []byte
+	bytes, err = signPKCS1v15([]byte(v), privateKey)
+	if err != nil {
+		return
+	}
+
+	sign = base64.StdEncoding.EncodeToString(bytes)
+	return
+}
+
+func (c *Client) do(method, str string) (body []byte, err error) {
+	payload := strings.NewReader(str)
+	req := &http.Request{}
+	resp := &http.Response{}
 	req, err = http.NewRequest(method, c.gateway, payload)
 	if err != nil {
 		return
@@ -142,41 +166,10 @@ func (c *Client) do(str string) (body []byte, err error) {
 	return ioutil.ReadAll(resp.Body)
 }
 
-func (c *Client) signature(values string) (sign string, err error) {
-	privateKey, err := parsePKCS1PrivateKey(c.appPrivateKey)
-	if err != nil {
-		privateKey, err = parsePKCS8PrivateKey(c.appPrivateKey)
-		if err != nil {
-			return
-		}
-	}
-
-	var bytes []byte
-	bytes, err = signPKCS1v15([]byte(values), privateKey)
-	if err != nil {
-		return
-	}
-
-	sign = base64.StdEncoding.EncodeToString(bytes)
-	return
-}
-
-type BizContent struct {
-	OutTradeNo  string `json:"out_trade_no"`
-	ProductId   string `json:"product_id"`
-	TotalAmount string `json:"total_amount"`
-	Subject     string `json:"subject"`
-	Body        string `json:"body"`
-}
-
 // Values
 type Values map[string][]string
 
-func (v Values) Add(key, value string) {
-	v[key] = append(v[key], value)
-}
-
-// Params
+// Params 把map转换成url形式，key=value&key1=value1
 func (v Values) Params() string {
 	if v == nil {
 		return ""
