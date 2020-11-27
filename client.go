@@ -11,8 +11,20 @@ import (
 	"time"
 )
 
+// OptionFunc 定义客户端配置选项
+type OptionFunc func(*Client)
+
+// WithTimeLocation 修改时区，默认为服务器本地时区
+func WithTimeLocation(location *time.Location) OptionFunc {
+	return func(c *Client) {
+		c.location = location
+	}
+}
+
 // Client 支付宝客户端
 type Client struct {
+	Trade
+
 	appId string
 
 	gateway  string
@@ -25,24 +37,19 @@ type Client struct {
 	alipayRootCert      string
 }
 
-// OptionFunc 定义配置选项option，option是一个func，入参是*Client实例，在里面我们可以修改实例的值。
-type OptionFunc func(*Client)
-
-// WithTimeLocation 设置时区，在初始化客户端的作为入参调用
-func WithTimeLocation(location *time.Location) OptionFunc {
-	return func(c *Client) {
-		c.location = location
-	}
-}
+var _ ITrade = &Client{}
 
 // New 初始化支付宝客户端
 func New(gateway, appId, privateKey string, opts ...OptionFunc) *Client {
 	client := &Client{
+		Trade:         Trade{},
 		appId:         appId,
 		gateway:       gateway,
 		location:      time.Local,
 		appPrivateKey: privateKey,
 	}
+
+	client.Trade.client = client
 
 	for _, opt := range opts {
 		opt(client)
@@ -51,126 +58,86 @@ func New(gateway, appId, privateKey string, opts ...OptionFunc) *Client {
 	return client
 }
 
-func (c *Client) Pay(subject, outTradeNo, totalAmount string) (string, error) {
-	v := url.Values{}
-	v.Add("app_id", c.appId)
-	v.Add("method", "alipay.trade.page.pay")
-	v.Add("charset", "utf-8")
-	v.Add("format", "JSON")
-	v.Add("sign_type", "RSA2")
-	v.Add("timestamp", c.getTimestamp())
-	v.Add("version", "1.0")
+func (client *Client) format(v interface{}, method string) (url.Values, error) {
+	values := url.Values{}
+	values.Add("app_id", client.appId)
+	values.Add("method", method)
+	values.Add("charset", "utf-8")
+	values.Add("format", "JSON")
+	values.Add("sign_type", "RSA2")
+	values.Add("timestamp", client.getTimestamp())
+	values.Add("version", "1.0")
 
-	type BizContent struct {
-		OutTradeNo  string `json:"out_trade_no"`
-		ProductId   string `json:"product_id"`
-		TotalAmount string `json:"total_amount"`
-		Subject     string `json:"subject"`
-		Body        string `json:"body"`
-	}
-
-	biz := BizContent{
-		OutTradeNo:  outTradeNo,
-		ProductId:   "FAST_INSTANT_TRADE_PAY",
-		TotalAmount: totalAmount,
-		Subject:     subject,
-		Body:        subject,
-	}
-
-	bytes, err := json.Marshal(biz)
+	bytes, err := json.Marshal(v)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	v.Add("biz_content", string(bytes))
+	values.Add("biz_content", string(bytes))
 
-	sign, err := c.getSignature(v)
+	urlValue := client.getUrlValue(values)
+
+	var sign string
+	sign, err = client.getSignature(urlValue)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	v.Add("sign", sign)
+	values.Add("sign", sign)
 
-	res, err := url.Parse(c.gateway + "?" + v.Encode())
-	if err != nil {
-		return "", err
-	}
-	return res.String(), nil
+	return values, nil
 }
 
-// AppPublicCert
-func (c *Client) AppPublicCert(filename string) error {
-	bytes, err := ioutil.ReadFile(filename)
+func (client *Client) getTimestamp() string {
+	return time.Now().In(client.location).Format("2006-01-02 15:04:05")
+}
+
+func (client *Client) getSignature(src string) (string, error) {
+	privateKey, err := parsePKCS1PrivateKey(client.appPrivateKey)
 	if err != nil {
-		return err
-	}
-
-	c.alipayPublicKeyCert = string(bytes)
-
-	return nil
-}
-
-// AlipayPublicCert
-func (c *Client) AlipayPublicCert() {
-
-}
-
-func (c *Client) getTimestamp() string {
-	return time.Now().In(c.location).Format("2006-01-02 15:04:05")
-}
-
-func (c *Client) getSignature(values url.Values) (sign string, err error) {
-	privateKey, err := parsePKCS1PrivateKey(c.appPrivateKey)
-	if err != nil {
-		privateKey, err = parsePKCS8PrivateKey(c.appPrivateKey)
+		privateKey, err = parsePKCS8PrivateKey(client.appPrivateKey)
 		if err != nil {
-			return
+			return "", err
 		}
 	}
 
-	v := Values(values).Params()
-
 	var bytes []byte
-	bytes, err = signPKCS1v15([]byte(v), privateKey)
+	bytes, err = signPKCS1v15([]byte(src), privateKey)
 	if err != nil {
-		return
+		return "", nil
 	}
 
-	sign = base64.StdEncoding.EncodeToString(bytes)
-	return
+	return base64.StdEncoding.EncodeToString(bytes), nil
 }
 
-func (c *Client) do(method, str string) (body []byte, err error) {
+func (client *Client) do(method, str string) ([]byte, error) {
 	payload := strings.NewReader(str)
-	req := &http.Request{}
-	resp := &http.Response{}
-	req, err = http.NewRequest(method, c.gateway, payload)
+	req, err := http.NewRequest(method, client.gateway, payload)
 	if err != nil {
-		return
+		return nil, err
 	}
 
 	// 设置请求头
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8")
 
-	client := http.Client{
+	c := http.Client{
 		Timeout: time.Second * 5,
 	}
 
-	resp, err = client.Do(req)
+	resp := &http.Response{}
+	resp, err = c.Do(req)
 	if err != nil {
-		return
+		return nil, err
 	}
 
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	return ioutil.ReadAll(resp.Body)
 }
 
-// Values
-type Values map[string][]string
-
-// Params 把map转换成url形式，key=value&key1=value1
-func (v Values) Params() string {
+func (client *Client) getUrlValue(v url.Values) string {
 	if v == nil {
 		return ""
 	}
